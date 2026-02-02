@@ -170,29 +170,46 @@ The system implements "Lightweight Sandboxing" using persistent Docker container
 
 ## 8. Core File Review List
 
-The following files represent the critical path for data flow, state management, and agent execution. Review these first to understand the system.
+This prioritized list (approx. 30 files) provides a vertical slice through the system, following the path from **User Message** to **Agent Action**.
 
-**Gateway & Protocol**
-*   `src/gateway/server.ts`: The main entry point for the WebSocket server.
-*   `src/gateway/server-methods.ts`: Maps RPC method names to handlers.
-*   `src/gateway/protocol/schema.ts`: Defines the TypeBox schema for the entire RPC protocol.
-*   `src/gateway/server-chat.ts`: Manages the chat run registry and broadcasting events.
+**Gateway & Protocol** (Hub)
+*   `src/gateway/server.ts`: Main entry point; WebSocket server setup.
+*   `src/gateway/server-methods.ts`: Router for RPC methods (`chat.send`, `agent`, etc.).
+*   `src/gateway/protocol/schema.ts`: TypeBox definitions for the entire API surface.
+*   `src/gateway/server-chat.ts`: Manages active chat runs and broadcasts events to UI.
 
-**Agent Runtime (The Brain)**
-*   `src/agents/pi-embedded-runner.ts`: The high-level orchestrator for the agent loop.
-*   `src/agents/pi-embedded-runner/run.ts`: The specific implementation of the "Thinking" loop (Prompt -> LLM -> Tool).
-*   `src/auto-reply/dispatch.ts`: The central router for inbound messages.
+**Ingress & Channels** (Ears)
+*   `src/plugin-sdk/index.ts`: The contract for all Channel Plugins.
+*   `src/channels/dock.ts`: Logic for loading, starting, and stopping plugins.
+*   `src/telegram/bot.ts`: Concrete example of a channel implementation (Telegram bot logic).
 
-**Memory & State**
-*   `src/memory/manager.ts`: The core logic for synchronizing Markdown files to the vector index.
-*   `src/memory/sqlite.ts`: The database access layer (including `sqlite-vec`).
-*   `src/session-utils.ts`: Helper functions for reading/writing session JSONL files.
+**Dispatch & Routing** (Nervous System)
+*   `src/auto-reply/dispatch.ts`: Central entry point for all inbound messages.
+*   `src/auto-reply/reply/dispatch-from-config.ts`: Decision engine: should the agent reply?
+*   `src/auto-reply/reply/get-reply.ts`: Orchestrator that sets up the agent runtime environment.
+*   `src/auto-reply/reply/reply-dispatcher.ts`: Manages output queuing, typing indicators, and chunking.
 
-**Tooling & Sandboxing**
-*   `src/agents/pi-tools.ts`: The registry that injects tools into the agent context.
-*   `src/agents/bash-tools.exec.ts`: Implementation of the `exec` tool (host & sandbox modes).
-*   `src/agents/sandbox/docker.ts`: Docker container management logic.
-*   `src/agents/bash-process-registry.ts`: Tracks background processes spawned by the agent.
+**Agent Runtime** (Brain)
+*   `src/agents/pi-embedded-runner.ts`: High-level "Thinking Loop" (LLM -> Tool -> Loop).
+*   `src/agents/pi-embedded-runner/run.ts`: Low-level execution logic for a single turn.
+*   `src/agents/pi-tools.ts`: Registry that injects tools into the LLM context.
+*   `src/agents/context.ts`: Critical logic for token counting and context window management.
+*   `src/agents/model-selection.ts`: Logic for resolving model aliases and fallbacks.
+*   `src/agents/auth-profiles.ts`: Management of API keys and provider rotation.
 
-**Extensibility**
-*   `src/plugin-sdk/index.ts`: The public API surface for Channel Plugins.
+**Memory & State** (Storage)
+*   `src/memory/manager.ts`: Orchestrates sync between Markdown files and Vector DB.
+*   `src/memory/sqlite.ts`: Database access layer (SQLite + `sqlite-vec`).
+*   `src/session-utils.ts`: Utilities for reading/writing JSONL session transcripts.
+*   `src/config/config.ts`: The master configuration schema for the system.
+*   `src/config/sessions.ts`: Resolution logic for session IDs and file paths.
+*   `src/sessions/transcript-events.ts`: Event bus triggering memory indexing on new messages.
+
+**Tooling & Sandboxing** (Hands)
+*   `src/agents/bash-tools.exec.ts`: Implementation of the `exec` tool (Host & Sandbox modes).
+*   `src/agents/sandbox/docker.ts`: Logic for creating and managing ephemeral Docker containers.
+*   `src/agents/bash-process-registry.ts`: State machine for tracking background processes.
+
+**Infrastructure** (Observability)
+*   `src/infra/diagnostic-events.ts`: Internal telemetry bus for system health.
+*   `src/logging/subsystem.ts`: Structured logging configuration.
