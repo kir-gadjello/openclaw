@@ -165,3 +165,34 @@ The system implements "Lightweight Sandboxing" using persistent Docker container
 
 1.  **Windows Support:** While code checks `process.platform === 'win32'`, the heavy reliance on POSIX signals (`SIGKILL`) and Docker paths suggests Windows support might be second-class or buggy.
 2.  **Multi-User Session Isolation:** Sessions are isolated by ID, but `MemoryIndexManager` seems shared per Agent Workspace. If multiple users share an Agent, do they share memory? (Code suggests `agentId` scope, implying shared memory for all users talking to that Agent). This has privacy implications.
+
+---
+
+## 8. Core File Review List
+
+The following files represent the critical path for data flow, state management, and agent execution. Review these first to understand the system.
+
+**Gateway & Protocol**
+*   `src/gateway/server.ts`: The main entry point for the WebSocket server.
+*   `src/gateway/server-methods.ts`: Maps RPC method names to handlers.
+*   `src/gateway/protocol/schema.ts`: Defines the TypeBox schema for the entire RPC protocol.
+*   `src/gateway/server-chat.ts`: Manages the chat run registry and broadcasting events.
+
+**Agent Runtime (The Brain)**
+*   `src/agents/pi-embedded-runner.ts`: The high-level orchestrator for the agent loop.
+*   `src/agents/pi-embedded-runner/run.ts`: The specific implementation of the "Thinking" loop (Prompt -> LLM -> Tool).
+*   `src/auto-reply/dispatch.ts`: The central router for inbound messages.
+
+**Memory & State**
+*   `src/memory/manager.ts`: The core logic for synchronizing Markdown files to the vector index.
+*   `src/memory/sqlite.ts`: The database access layer (including `sqlite-vec`).
+*   `src/session-utils.ts`: Helper functions for reading/writing session JSONL files.
+
+**Tooling & Sandboxing**
+*   `src/agents/pi-tools.ts`: The registry that injects tools into the agent context.
+*   `src/agents/bash-tools.exec.ts`: Implementation of the `exec` tool (host & sandbox modes).
+*   `src/agents/sandbox/docker.ts`: Docker container management logic.
+*   `src/agents/bash-process-registry.ts`: Tracks background processes spawned by the agent.
+
+**Extensibility**
+*   `src/plugin-sdk/index.ts`: The public API surface for Channel Plugins.
