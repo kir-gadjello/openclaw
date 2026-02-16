@@ -1,4 +1,4 @@
-# Engineering Audit: OpenClaw (Deep Dive)
+# Engineering Audit: OpenClaw
 
 ## 1. Executive Overview
 
@@ -15,7 +15,7 @@ The system is built on a **Hub-and-Spoke** model:
 *   **Hybrid Memory Index:** `MemoryIndexManager` combines vector search (`sqlite-vec`) with full-text search (`FTS5`), underpinned by a filesystem-watcher sync engine. This allows users to edit memory files (`MEMORY.md`) directly in their IDE, with near-real-time agent awareness.
 *   **Robust Diagnostics:** A dedicated `diagnostic-events.ts` subsystem emits structured telemetry (latency, token usage, tool results) for the Control UI, decoupled from the main execution path.
 
-**Critical Risks (Deep Dive):**
+**Critical Risks:**
 1.  **State Synchronization Fragility:** The reliance on `chokidar` file watchers to trigger SQLite updates introduces potential race conditions. If the watcher misses an event (OS limit, rapid churn), the vector index desynchronizes from the "Truth" (Markdown files).
 2.  **"God Class" Runner:** `PiEmbeddedRunner.ts` encapsulates prompt construction, context window management, error handling, and tool dispatch. This high coupling makes testing individual behaviors (e.g., specific context truncation logic) difficult without running a full simulation.
 3.  **Process Management Leakage:** While `bash-process-registry.ts` tracks child processes, long-running detached processes in "host mode" rely on the OS process table. A crash of the main Gateway process can orphan these children.
@@ -26,9 +26,22 @@ The system is built on a **Hub-and-Spoke** model:
 *   **Tooling:** `src/agents/bash-tools.exec.ts` (Command execution) & `src/agents/sandbox/docker.ts` (Isolation).
 *   **Memory:** `src/memory/manager.ts` (Orchestration) & `src/memory/sqlite.ts` (Storage).
 
----
+## 2. Goals and Constraints
 
-## 2. Architecture & Data Flow (Trace)
+**Explicit Goals:**
+*   **Local-First Data:** The architecture rigidly enforces that the "Source of Truth" is the filesystem (`~/.openclaw/workspace` and `~/.openclaw/sessions`). The SQLite database acts as a derived index, not the primary store.
+*   **Model Agnosticism:** The `ModelFallback` logic allows seamless switching between providers (Anthropic, OpenAI, Local) mid-session, critical for reliability.
+*   **Platform Extensibility:** The `plugin-sdk` ensures that adding a new channel (e.g., Matrix) does not require changes to the core Gateway or Agent logic.
+
+**Implicit Goals:**
+*   **Single-User / Personal:** The architecture assumes an "Operator" model where the user has admin-level access to the machine. While multi-agent support exists, true multi-tenant security (user A cannot see user B's agent) is not a primary design constraint.
+*   **Low Latency UI:** The architecture decouples "Chat UI" events (deltas) from "Agent" thinking. This "Optimistic UI" pattern is essential for perceived performance when using slow reasoning models.
+
+**Constraints:**
+*   **Runtime:** Node.js >= 22 is required for modern fetch/stream APIs.
+*   **Deployment:** Designed to run as a long-lived daemon (Gateway). Stateless serverless deployment is not supported due to the reliance on persistent filesystem watchers and background process management.
+
+## 3. Architecture Tour
 
 ### A. The "Chat" Flow (Inbound -> Response)
 
@@ -61,116 +74,88 @@ The system is built on a **Hub-and-Spoke** model:
     *   It calls `nodeSendToSession` to push deltas to the WebSocket (for the UI).
     *   For external channels, `createReplyDispatcher` buffers the stream and calls the channel plugin's `sendMessage` method.
 
-### B. The "Memory" Flow (Sync)
+## 4. State, Data Model, and Invariants
 
-1.  **Watcher (`src/memory/manager.ts`):**
-    *   `chokidar` watches `~/.openclaw/workspace/**/*.md`.
-    *   On `change` event: Sets `this.dirty = true` and debounces a sync task.
+### The "Memory" Flow (Sync)
 
-2.  **Indexing (`syncMemoryFiles`):**
-    *   **Read:** Reads the raw Markdown content.
-    *   **Chunk:** Calls `chunkMarkdown` (`src/memory/internal.ts`) to split text into overlapping windows (default: 512 tokens).
-    *   **Hash:** Computes SHA-256 hash of each chunk to skip unchanged segments.
+**Core Entities:**
+*   **Memory Files:** Markdown files in `~/.openclaw/workspace`. These are the authoritative source.
+*   **Vector Index:** A derived SQLite database (`memory.db`) containing embeddings for semantic search.
 
-3.  **Embedding:**
-    *   Calls `provider.embedBatch` (e.g., `text-embedding-3-small`).
-    *   **Caching:** Results are cached in SQLite table `embedding_cache` to save API costs.
+**Synchronization Trace (`src/memory/manager.ts`):**
+1.  **Watcher:** `chokidar` watches the workspace. On `change`, it flags the index as `dirty` and debounces a sync.
+2.  **Indexing:** `syncMemoryFiles` reads the raw Markdown.
+3.  **Chunking:** `chunkMarkdown` (`src/memory/internal.ts`) splits text into overlapping windows (default: 512 tokens).
+4.  **Hashing:** Computes SHA-256 hash of each chunk.
+5.  **Embedding:** Calls `provider.embedBatch`. Results are cached in `embedding_cache` table to minimize API costs.
+6.  **Storage:** Writes to `chunks_vec` (Virtual Table) and `chunks_fts` (FTS5).
 
-4.  **Storage (`src/memory/sqlite.ts`):**
-    *   **Vector:** Writes embeddings to `chunks_vec` (Virtual Table using `sqlite-vec`).
-    *   **Keyword:** Writes text to `chunks_fts` (Virtual Table using FTS5).
-    *   **Meta:** Updates `files` table with path, mtime, and hash.
+**Invariant:** The SQLite index must strictly reflect the content of the Markdown files. If they drift (e.g., due to a crash during write), the agent will "hallucinate" memory content that doesn't exist on disk.
 
----
+## 5. Runtime Model
 
-## 3. Tooling & Sandboxing (Specifics)
+**Concurrency:**
+*   **Event Loop:** Heavily relies on Node.js async/await.
+*   **Lanes:** `src/agents/lanes.ts` implements a per-session queue. This prevents race conditions where two inbound messages to the same session trigger parallel LLM runs, confusing the context window state.
 
-### A. `exec` Tool (`src/agents/bash-tools.exec.ts`)
+**Performance:**
+*   **Critical Path:** The "Thinking Loop" is IO-bound by the LLM API latency.
+*   **Bottleneck (Vector Store):** `src/memory/manager.ts` creates the `chunks_vec` table without explicit index parameters (e.g., IVF). This implies **Brute Force** search (`O(N)`). While fast for <10k chunks, this will become a significant CPU bottleneck as memory grows >100k chunks, blocking the main event loop during search.
 
-The `exec` tool is the powerhouse of the "Coding Agent" persona.
+## 6. Engineering Quality
 
-*   **Mode Selection:**
-    *   **Host Mode:** Runs directly on the machine via `node-pty` or `child_process.spawn`.
-    *   **Sandbox Mode:** Delegates to Docker.
+**Strengths:**
+*   **Type Safety:** Extensive use of TypeScript and TypeBox (`@sinclair/typebox`) for runtime validation of the RPC protocol in `src/gateway/protocol/schema.ts`.
+*   **Testing:** Comprehensive test suite structure (`*.test.ts` co-located), with distinct E2E tests for the gateway.
+*   **Module Boundaries:** `src/plugin-sdk` strictly defines the contract for extensions, preventing spaghetti dependencies.
 
-*   **Execution Logic:**
-    *   Creates a `ProcessSession` entry in the registry (`src/agents/bash-process-registry.ts`).
-    *   Spawns the process.
-    *   **Output Buffering:** Stdout/Stderr are chunked and appended to the session's `aggregated` log.
-    *   **Backgrounding:** If `background: true` is passed, the tool returns immediately with the `sessionId`, leaving the process running. The agent can later use the `process` tool to `poll` or `kill` it.
+**Observability:**
+*   **Structured Logging:** `ws-log.ts` provides subsystem-aware logging.
+*   **Diagnostics:** `infra/diagnostic-events.ts` acts as an internal event bus for tracking health (heartbeats, queue sizes) without coupling components.
 
-### B. Sandboxing (`src/agents/sandbox/docker.ts`)
+## 7. Domain-Specific Notes
 
-The system implements "Lightweight Sandboxing" using persistent Docker containers.
+**Tooling & Sandboxing (`src/agents/bash-tools.exec.ts`):**
+The `exec` tool powers the "Coding Agent" persona.
+*   **Host Mode:** Runs directly on the machine via `node-pty`.
+    *   **Risk:** `mergedEnv` combines `process.env` with user-provided env vars. This leaks host secrets (API keys) to the child process.
+*   **Sandbox Mode:** Delegates to `docker create` / `docker exec`.
+    *   **Mechanism:** `buildSandboxCreateArgs` mounts the workspace as a volume. This ensures file persistence while keeping the runtime environment ephemeral.
 
-*   **Construction:** `buildSandboxCreateArgs` builds the `docker create` command.
-    *   **Flags:** `--read-only` (root fs), `--tmpfs` (for /tmp), `--network` (configurable), `--security-opt no-new-privileges`.
-    *   **Mounts:**
-        *   `workspaceDir` is mounted as read-write (or read-only based on policy) to `/app`.
-        *   This allows the agent to edit files in the workspace without those changes persisting in the container image itself.
+**AI "Thinking" (`src/auto-reply/thinking.ts`):**
+The system explicitly handles "Chain-of-Thought" models. It normalizes "thinking" blocks from different providers (e.g., Anthropic vs OpenAI O1) into a unified internal format so the UI can render them consistently.
 
-*   **Lifecycle:**
-    *   `ensureSandboxContainer` checks if a container with the hash of the current config exists.
-    *   If the config changed, it destroys and recreates the container.
-    *   This ensures "Clean Slate" execution relative to the configuration, but "Persistent State" relative to the mounted workspace.
-
----
-
-## 4. State & Persistence
-
-**Data Model:**
-*   **SQLite (`memory.db`):**
-    *   `files (path, hash, mtime)`: Tracks source file state.
-    *   `chunks (id, text, embedding)`: The search index.
-    *   `embedding_cache`: Cost-saving cache.
-    *   `chunks_vec`: Vector index (Virtual Table).
-    *   `chunks_fts`: Keyword index (Virtual Table).
-
-**Session Persistence:**
-*   **JSONL:** Sessions are stored as newline-delimited JSON files.
-    *   Pros: Append-only, corruption-resistant, human-readable (`tail -f`).
-    *   Cons: Random access is O(N). Reading the full history for context window calculation requires parsing the entire file.
-
-**Locking:**
-*   **File System:** No strict file locking (flock). Reliance on atomic writes (`rename`) for config updates, but session appends rely on OS-level atomicity of small writes. Potential race condition for very large concurrent writes.
-
----
-
-## 5. Weaknesses & Risks (Evidence-Based)
+## 8. Weaknesses and Risks
 
 1.  **Vector Store Scale Limits:**
-    *   **Evidence:** `src/memory/manager.ts` loads `sqlite-vec` into the process address space.
-    *   **Risk:** `sqlite-vec` performs brute-force search (or simple IVF) inside the Node.js process. As chunk count grows > 100k, search latency will degrade the interactive chat loop. It is not a distributed vector database.
-    *   **Fix:** Implement an abstraction layer to offload to Qdrant/pgvector for high-scale deployments.
+    *   **Evidence:** `src/memory/manager.ts` initializes `vec0` tables without index configuration.
+    *   **Risk:** Brute-force vector search works in-process. At scale, a single memory search could block the Node.js event loop for hundreds of milliseconds, causing jitter in the WebSocket gateway and UI.
+    *   **Mitigation:** Implement HNSW or IVF indexing in `sqlite-vec`, or offload to a dedicated vector DB service.
 
 2.  **Secret Leakage via Environment Variables:**
-    *   **Evidence:** `src/agents/bash-tools.exec.ts` merges `process.env` into the child process environment unless explicitly sandboxed.
-    *   **Risk:** If `host` execution is enabled, a malicious prompt could inspect `env` and exfiltrate API keys (e.g., `OPENAI_API_KEY`) present in the Gateway's environment.
-    *   **Fix:** Strict allowlist for environment variables passed to `exec`, even in host mode.
+    *   **Evidence:** `src/agents/bash-tools.exec.ts` merges `baseEnv` (process.env) into the child process environment for Host Mode execution.
+    *   **Risk:** A malicious prompt could inspect `env` and exfiltrate the Gateway's own API keys (e.g., `OPENAI_API_KEY`).
+    *   **Mitigation:** Enforce a strict allowlist for environment variables passed to `exec` in host mode.
 
 3.  **Zombie Processes:**
-    *   **Evidence:** `src/agents/bash-process-registry.ts` tracks processes in memory (`runningSessions` Map).
-    *   **Risk:** If the Gateway crashes and restarts, the in-memory map is lost. Any backgrounded processes (e.g., a `node server.js` started by the agent) become orphaned zombies. The agent loses control of them.
-    *   **Fix:** Write process PIDs to a persistent "runfile" on disk to attempt re-attachment or cleanup on startup.
+    *   **Evidence:** `src/agents/bash-process-registry.ts` tracks running processes in a simple in-memory `Map`.
+    *   **Risk:** If the Gateway process crashes or restarts, this map is lost. Any backgrounded processes (e.g., a user-requested server) become orphaned zombies that the agent can no longer control or kill.
+    *   **Mitigation:** Persist the process registry (PIDs) to disk to allow re-attachment or cleanup upon Gateway restart.
 
----
+## 9. Likely Future Development
 
-## 6. Likely Future Development
+*   **"Supervisor" Architecture:** The codebase hints at sub-agent logic. A formal Supervisor agent that spawns ephemeral, task-specific agents (e.g., "ResearchAgent", "CoderAgent") is a natural evolution.
+*   **Remote Gateway:** While local-first, the architecture allows for a split deployment. Syncing the local state to a private cloud for multi-device access is a plausible next step.
+*   **Voice-First:** With `voicewake` endpoints already present, evolving into a full-duplex voice assistant (interrupting TTS) is a clear path.
 
-*   **"Supervisor" Architecture:** The codebase contains hints of `subagent` logic (`src/agents/pi-tools.ts`). The next logical step is a formal "Supervisor" capability where the main agent can spawn specialized ephemeral agents (e.g., "ResearchAgent") with restricted toolsets.
-*   **Remote Tool Execution:** The `Plugin SDK` allows tools. Future evolution would be allowing tools to run over the network (MCP - Model Context Protocol support seems like a natural fit given the architecture).
-*   **Voice-First:** With `voicewake` endpoints already in `server-methods`, moving to full duplex voice interaction (interruping the TTS output) is a likely trajectory.
+## 10. Open Questions
 
-## 7. Open Questions
+1.  **Windows Support:** Heavy reliance on POSIX signals (`SIGKILL`) and Docker paths suggests Windows support might be second-class. Does `node-pty` behave consistently on Windows in this implementation?
+2.  **Multi-User Session Isolation:** Sessions are isolated by ID, but `MemoryIndexManager` is scoped to the Agent Workspace. If multiple users interact with the same Agent, do they share memory? This has significant privacy implications in a shared deployment.
 
-1.  **Windows Support:** While code checks `process.platform === 'win32'`, the heavy reliance on POSIX signals (`SIGKILL`) and Docker paths suggests Windows support might be second-class or buggy.
-2.  **Multi-User Session Isolation:** Sessions are isolated by ID, but `MemoryIndexManager` seems shared per Agent Workspace. If multiple users share an Agent, do they share memory? (Code suggests `agentId` scope, implying shared memory for all users talking to that Agent). This has privacy implications.
+## 11. Core File Review List
 
----
-
-## 8. Core File Review List
-
-This prioritized list (approx. 30 files) provides a vertical slice through the system, following the path from **User Message** to **Agent Action**.
+This prioritized list provides a vertical slice through the system, following the path from **User Message** to **Agent Action**.
 
 **Gateway & Protocol** (Hub)
 *   `src/gateway/server.ts`: Main entry point; WebSocket server setup.
